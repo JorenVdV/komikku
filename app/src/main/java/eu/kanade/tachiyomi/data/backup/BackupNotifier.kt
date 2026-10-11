@@ -14,6 +14,8 @@ import eu.kanade.tachiyomi.util.storage.getUriCompat
 import eu.kanade.tachiyomi.util.system.cancelNotification
 import eu.kanade.tachiyomi.util.system.notificationBuilder
 import eu.kanade.tachiyomi.util.system.notify
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import tachiyomi.core.common.i18n.pluralStringResource
 import tachiyomi.core.common.i18n.stringResource
 import tachiyomi.core.common.storage.displayablePath
@@ -30,6 +32,11 @@ class BackupNotifier(private val context: Context) {
 
     // KMK -->
     private val backupRestoreStatus: BackupRestoreStatus = Injekt.get()
+    // KMK <--
+
+    // KMK -->
+    // Serialises restore progress updates (SY uses @Synchronized, which can't guard a suspend fun)
+    private val restoreProgressMutex = Mutex()
     // KMK <--
 
     private val progressNotificationBuilder = context.notificationBuilder(
@@ -107,39 +114,47 @@ class BackupNotifier(private val context: Context) {
         maxAmount: Int = 100,
         sync: Boolean = false,
     ): NotificationCompat.Builder {
-        val builder = with(progressNotificationBuilder) {
-            val contentTitle = if (sync) {
-                context.stringResource(MR.strings.syncing_library)
-            } else {
-                context.stringResource(MR.strings.restoring_backup)
-            }
-            setContentTitle(contentTitle)
+        // KMK -->
+        // The restorers run concurrently and share this builder; mutating its actions from two
+        // coroutines at once throws a ConcurrentModificationException and fails the restore.
+        restoreProgressMutex.withLock {
+            // KMK <--
+            val builder = with(progressNotificationBuilder) {
+                val contentTitle = if (sync) {
+                    context.stringResource(MR.strings.syncing_library)
+                } else {
+                    context.stringResource(MR.strings.restoring_backup)
+                }
+                setContentTitle(contentTitle)
 
-            if (!preferences.hideNotificationContent().get()) {
-                setContentText(content)
+                if (!preferences.hideNotificationContent().get()) {
+                    setContentText(content)
+                }
+
+                setProgress(maxAmount, progress, false)
+                setOnlyAlertOnce(true)
+                // KMK -->
+                backupRestoreStatus.updateProgress(progress.toFloat() / maxAmount)
+                // KMK <--
+
+                clearActions()
+                addAction(
+                    R.drawable.ic_close_24dp,
+                    context.stringResource(MR.strings.action_cancel),
+                    NotificationReceiver.cancelRestorePendingBroadcast(context, Notifications.ID_RESTORE_PROGRESS),
+                )
             }
 
-            setProgress(maxAmount, progress, false)
-            setOnlyAlertOnce(true)
             // KMK -->
-            backupRestoreStatus.updateProgress(progress.toFloat() / maxAmount)
+            // Avoid calling show() before returning builder for ForegroundInfo.
+            // Calling show() here can cause duplicate notifications, as setForegroundSafely will display the notification using the returned builder.
+            // builder.show(Notifications.ID_RESTORE_PROGRESS)
             // KMK <--
 
-            clearActions()
-            addAction(
-                R.drawable.ic_close_24dp,
-                context.stringResource(MR.strings.action_cancel),
-                NotificationReceiver.cancelRestorePendingBroadcast(context, Notifications.ID_RESTORE_PROGRESS),
-            )
+            return builder
+            // KMK -->
         }
-
-        // KMK -->
-        // Avoid calling show() before returning builder for ForegroundInfo.
-        // Calling show() here can cause duplicate notifications, as setForegroundSafely will display the notification using the returned builder.
-        // builder.show(Notifications.ID_RESTORE_PROGRESS)
         // KMK <--
-
-        return builder
     }
 
     fun showRestoreError(error: String?) {
